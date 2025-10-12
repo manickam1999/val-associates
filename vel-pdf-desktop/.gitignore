@@ -1,0 +1,8 @@
+node_modules/
+dist/
+resources/backend/
+resources/frontend/
+build/*.spec
+scripts/build/
+*.log
+.DS_Store

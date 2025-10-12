@@ -7,6 +7,15 @@ A full-stack application for converting Malaysian STR (Statutory Reports) PDFs t
 This project consists of two main services:
 - **vel-pdf-api**: FastAPI backend for PDF processing and data extraction
 - **vel-pdf-web**: Next.js frontend with modern React UI
+- **vel-pdf-desktop**: Electron desktop application for Windows (standalone .exe)
+
+## Deployment Options
+
+1. **Docker Compose** (Recommended for servers): Run both services with Docker
+2. **Manual Installation**: Run services individually for development
+3. **Windows Desktop App**: Standalone executable for Windows users (no installation required)
+   - See [vel-pdf-desktop/README.md](vel-pdf-desktop/README.md) for building Windows .exe
+   - See [vel-pdf-desktop/QUICK-START.md](vel-pdf-desktop/QUICK-START.md) for quick setup
 
 ## Features
 
