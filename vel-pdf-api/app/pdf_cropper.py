@@ -7,6 +7,10 @@ import cv2
 import numpy as np
 import pdfplumber
 from pathlib import Path
+from .config.constants import (
+    MIN_BORDER_OFFSET, BORDER_AREA_THRESHOLD, MAX_MARGIN_THRESHOLD,
+    BORDER_THRESHOLD_VALUE, BORDER_DETECTION_DPI
+)
 
 
 def detect_border(image_array):
@@ -24,7 +28,7 @@ def detect_border(image_array):
 
     # Apply binary threshold to detect black areas
     # Black border should be close to 0 (black)
-    _, binary = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
+    _, binary = cv2.threshold(gray, BORDER_THRESHOLD_VALUE, 255, cv2.THRESH_BINARY_INV)
 
     # Find contours
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -43,24 +47,20 @@ def detect_border(image_array):
     contour_area = w * h
     image_area = img_width * img_height
 
-    # Border should cover at least 80% of the image
-    if contour_area < 0.8 * image_area:
+    # Border should cover at least threshold % of the image
+    if contour_area < BORDER_AREA_THRESHOLD * image_area:
         return None
 
     # IMPORTANT: Real black borders (v2 format) start significantly inside the page
     # False positives (v1 format) start at page edges (x≈5, y≈5)
     # Real v2 border starts around x=64, y=64
-    # Set minimum threshold to distinguish them
-    MIN_BORDER_OFFSET = 30  # pixels from edge
-
     if x < MIN_BORDER_OFFSET or y < MIN_BORDER_OFFSET:
         # This is too close to the edge - likely a false positive (page edge detection)
         return None
 
     # Border should also not be too far from edges (sanity check)
-    max_margin_threshold = 0.10  # 10% of page size
-    if (x > img_width * max_margin_threshold or
-        y > img_height * max_margin_threshold):
+    if (x > img_width * MAX_MARGIN_THRESHOLD or
+        y > img_height * MAX_MARGIN_THRESHOLD):
         return None
 
     # Approximate polygon to check if it's rectangular
@@ -75,13 +75,13 @@ def detect_border(image_array):
     return (x, y, w, h)
 
 
-def detect_v2_border(input_pdf_path, dpi=150):
+def detect_v2_border(input_pdf_path, dpi=BORDER_DETECTION_DPI):
     """
     Detect if PDF has v2 black border format
 
     Args:
         input_pdf_path: Path to input PDF file
-        dpi: DPI for border detection (default: 150)
+        dpi: DPI for border detection
 
     Returns:
         bool: True if v2 border detected, False otherwise
@@ -117,14 +117,14 @@ def detect_v2_border(input_pdf_path, dpi=150):
         return False
 
 
-def crop_pdf_if_needed(input_pdf_path, dpi=150):
+def crop_pdf_if_needed(input_pdf_path, dpi=BORDER_DETECTION_DPI):
     """
     Detect if PDF has v2 border (for backward compatibility)
     Returns original path and detection result
 
     Args:
         input_pdf_path: Path to input PDF file
-        dpi: DPI for border detection (default: 150)
+        dpi: DPI for border detection
 
     Returns:
         tuple: (pdf_path, has_v2_border, None)
@@ -136,11 +136,3 @@ def crop_pdf_if_needed(input_pdf_path, dpi=150):
     return str(input_pdf_path), has_border, None
 
 
-def cleanup_temp_file(temp_file_path):
-    """
-    Clean up temporary file (no-op for compatibility)
-
-    Args:
-        temp_file_path: Path to temporary file
-    """
-    pass  # No temp files created anymore

@@ -9,9 +9,20 @@ import re
 import copy
 import pdfplumber
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
-from .pdf_cropper import crop_pdf_if_needed, cleanup_temp_file
+from .pdf_cropper import crop_pdf_if_needed
+from .config.constants import (
+    V2_OFFSET_X, V2_OFFSET_Y, TOLERANCE_DEFAULT, TOLERANCE_TIGHT, TOLERANCE_LABEL,
+    SECTION_HEADERS, SEARCH_RANGE_DEFAULT, SEARCH_RANGE_WARIS,
+    WARIS_FIELD_LABELS, PASANGAN_FIELD_LABELS, SAME_LINE_THRESHOLD,
+    DOCUMENT_TYPE, EXTRACTION_VERSION, EXCEL_SHEET_NAME, MAX_CHILDREN
+)
+from .utils.text_cleaners import (
+    clean_age_field, remove_section_labels, extract_postal_code, remove_numbers,
+    remove_whitespace, remove_trailing_rm, extract_numbers_only, clean_jantina_field,
+    extract_alphabets_only, clean_mykad_number, is_state_in_address
+)
 
 
 class STRExtractor:
@@ -55,18 +66,10 @@ class STRExtractor:
         template_x = template_box['x']
         template_w = template_box['width']
 
-        # Expected header text keywords
-        header_keywords = {
-            'maklumat_pemohon_header': ['MAKLUMAT', 'PEMOHON'],
-            'maklumat_pasangan_header': ['MAKLUMAT', 'PASANGAN'],
-            'maklumat_anak_header': ['MAKLUMAT', 'ANAK'],
-            'maklumat_waris_header': ['MAKLUMAT', 'WARIS']
-        }
-
-        keywords = header_keywords.get(header_field_name, ['MAKLUMAT'])
+        keywords = SECTION_HEADERS.get(header_field_name, ['MAKLUMAT'])
 
         # Use larger search range for waris section (variable position due to anak section)
-        search_range = 200 if header_field_name == 'maklumat_waris_header' else 50
+        search_range = SEARCH_RANGE_WARIS if header_field_name == 'maklumat_waris_header' else SEARCH_RANGE_DEFAULT
 
         try:
             # Get all words in the page
@@ -93,10 +96,10 @@ class STRExtractor:
                             elif 'WARIS' in word_text:
                                 waris_words.append((word_y, word_x, word_text))
 
-                # Find MAKLUMAT and WARIS that are on the same line (within 5px vertically)
+                # Find MAKLUMAT and WARIS that are on the same line
                 for mak_y, mak_x, mak_text in maklumat_words:
                     for war_y, war_x, war_text in waris_words:
-                        if abs(mak_y - war_y) <= 5:  # Same line
+                        if abs(mak_y - war_y) <= SAME_LINE_THRESHOLD:
                             actual_y = mak_y
                             offset = int(actual_y - template_y)
                             return offset
@@ -128,14 +131,14 @@ class STRExtractor:
 
         return 0  # No offset if header not found
 
-    def extract_text_from_box(self, page, box, y_offset=0, tolerance=5):
+    def extract_text_from_box(self, page, box, y_offset=0, tolerance=TOLERANCE_DEFAULT):
         """Extract text using word filtering with section-based Y-offset and tolerance
 
         Args:
             page: pdfplumber page object
             box: dictionary with 'x', 'y', 'width', 'height' keys
             y_offset: Section-specific Y-offset in pixels
-            tolerance: Y-axis tolerance in pixels (default: 5px for tight matching)
+            tolerance: Y-axis tolerance in pixels
 
         Returns:
             Extracted text string
@@ -223,173 +226,241 @@ class STRExtractor:
         except Exception as e:
             return []
 
-    def extract_waris_section(self, page):
-        """Extract MAKLUMAT WARIS using header-based positioning"""
+    def _extract_section_by_header(self, page, header_keywords: List[str],
+                                    field_labels: Dict[str, str],
+                                    next_section_keywords: Optional[List[str]] = None) -> Dict[str, str]:
+        """Generic method to extract a section using header-based positioning
+
+        Args:
+            page: pdfplumber page object
+            header_keywords: Keywords to find section header (e.g., ['MAKLUMAT', 'WARIS'])
+            field_labels: Dict mapping field keys to label text
+            next_section_keywords: Keywords for next section to limit extraction (optional)
+
+        Returns:
+            Dict of extracted field values
+        """
         try:
-            # Find the "MAKLUMAT WARIS" header text
+            # Find the section header text
             text_objects = page.extract_words()
 
-            waris_header_y = None
+            header_y = None
             for word in text_objects:
                 text = word['text'].upper()
-                if 'MAKLUMAT' in text and 'WARIS' in text:
-                    waris_header_y = word['bottom']
+                if all(kw in ' '.join([w['text'].upper() for w in text_objects
+                                       if abs(w['top'] - word['top']) < SAME_LINE_THRESHOLD])
+                       for kw in header_keywords):
+                    header_y = word['bottom']
                     break
-                elif 'WARIS' in text:
-                    # Check if MAKLUMAT is nearby
-                    for other_word in text_objects:
-                        if abs(other_word['top'] - word['top']) < 5 and 'MAKLUMAT' in other_word['text'].upper():
-                            waris_header_y = max(word['bottom'], other_word['bottom'])
-                            break
-                    if waris_header_y:
-                        break
 
-            if not waris_header_y:
-                return {}
-
-            # Define approximate field positions relative to header
-            field_labels = {
-                'hubungan': 'Hubungan',
-                'no_pengenalan': 'No Pengenalan',
-                'nama': 'Nama',
-                'no_telefon': 'No Telefon'
-            }
-
-            waris_data = {}
-
-            # Extract text in the WARIS section (from header to bottom of page)
-            waris_bbox = (0, waris_header_y, page.width, page.height)
-            waris_section = page.within_bbox(waris_bbox)
-            waris_words = waris_section.extract_words()
-
-            # For each field, find the label and extract the value after it
-            for field_key, label_text in field_labels.items():
-                label_found = False
-                for i, word in enumerate(waris_words):
-                    if label_text.upper() in word['text'].upper():
-                        label_found = True
-                        # Find text on the same line or slightly below (within 10px)
-                        label_y = word['top']
-                        label_x_end = word['x1']
-
-                        # Collect all text after the label on the same line
-                        value_parts = []
-                        for other_word in waris_words:
-                            # Check if word is on the same line and to the right of label
-                            if abs(other_word['top'] - label_y) < 10 and other_word['x0'] > label_x_end:
-                                # Skip colons
-                                if other_word['text'].strip() != ':':
-                                    value_parts.append(other_word['text'])
-
-                        if value_parts:
-                            waris_data[field_key] = ' '.join(value_parts).strip()
-                        else:
-                            waris_data[field_key] = ""
-                        break
-
-                if not label_found:
-                    waris_data[field_key] = ""
-
-            return waris_data
-
-        except Exception as e:
-            return {}
-
-    def extract_pasangan_section(self, page):
-        """Extract MAKLUMAT PASANGAN using header-based positioning"""
-        try:
-            # Find the "MAKLUMAT PASANGAN" header text
-            text_objects = page.extract_words()
-
-            pasangan_header_y = None
-            for word in text_objects:
-                text = word['text'].upper()
-                if 'MAKLUMAT' in text and 'PASANGAN' in text:
-                    pasangan_header_y = word['bottom']
-                    break
-                elif 'PASANGAN' in text:
-                    # Check if MAKLUMAT is nearby
-                    for other_word in text_objects:
-                        if abs(other_word['top'] - word['top']) < 5 and 'MAKLUMAT' in other_word['text'].upper():
-                            pasangan_header_y = max(word['bottom'], other_word['bottom'])
-                            break
-                    if pasangan_header_y:
-                        break
-
-            if not pasangan_header_y:
+            if not header_y:
                 return {}
 
             # Find the next section header to limit extraction area
             next_section_y = page.height
-            for word in text_objects:
-                if word['top'] > pasangan_header_y:
-                    text = word['text'].upper()
-                    if 'MAKLUMAT' in text and ('ANAK' in text or 'WARIS' in text):
-                        next_section_y = word['top']
-                        break
+            if next_section_keywords:
+                for word in text_objects:
+                    if word['top'] > header_y:
+                        text = word['text'].upper()
+                        if any(kw in text for kw in next_section_keywords):
+                            next_section_y = word['top']
+                            break
 
-            # Define field labels for PASANGAN
-            field_labels = {
-                'nama': 'Nama',
-                'jenis_pengenalan': 'Jenis Pengenalan',
-                'no_mykad': 'MyKAD',
-                'negara_asal': 'Negara Asal',
-                'no_telefon': 'No. Telefon',
-                'jantina': 'Jantina',
-                'pekerjaan': 'Pekerjaan',
-                'nama_bank': 'Nama Bank Pasangan',
-                'no_akaun_bank': 'No Akaun Bank Pasangan'
-            }
+            # Extract text in the section
+            section_bbox = (0, header_y, page.width, next_section_y)
+            section = page.within_bbox(section_bbox)
+            section_words = section.extract_words()
 
-            pasangan_data = {}
-
-            # Extract text in the PASANGAN section (from header to next section)
-            pasangan_bbox = (0, pasangan_header_y, page.width, next_section_y)
-            pasangan_section = page.within_bbox(pasangan_bbox)
-            pasangan_words = pasangan_section.extract_words()
-
-            # For each field, find the label and extract the value after it
+            # Extract field values
+            extracted_data = {}
             for field_key, label_text in field_labels.items():
-                label_found = False
-                for i, word in enumerate(pasangan_words):
+                for i, word in enumerate(section_words):
                     if label_text.upper() in word['text'].upper():
-                        label_found = True
-                        # Find text on the same line or slightly below (within 10px)
                         label_y = word['top']
                         label_x_end = word['x1']
 
                         # Collect all text after the label on the same line
                         value_parts = []
-                        for other_word in pasangan_words:
-                            # Check if word is on the same line and to the right of label
-                            if abs(other_word['top'] - label_y) < 10 and other_word['x0'] > label_x_end:
-                                # Skip colons and field labels
-                                text = other_word['text'].strip()
-                                if text != ':' and text.upper() not in label_text.upper():
-                                    value_parts.append(text)
+                        for other_word in section_words:
+                            if (abs(other_word['top'] - label_y) < TOLERANCE_LABEL and
+                                other_word['x0'] > label_x_end and
+                                other_word['text'].strip() != ':'):
+                                value_parts.append(other_word['text'])
 
-                        if value_parts:
-                            pasangan_data[field_key] = ' '.join(value_parts).strip()
-                        else:
-                            pasangan_data[field_key] = ""
+                        extracted_data[field_key] = ' '.join(value_parts).strip() if value_parts else ""
                         break
 
-                if not label_found:
-                    pasangan_data[field_key] = ""
+                if field_key not in extracted_data:
+                    extracted_data[field_key] = ""
 
-            return pasangan_data
+            return extracted_data
 
         except Exception as e:
             return {}
+
+    def extract_waris_section(self, page):
+        """Extract MAKLUMAT WARIS using header-based positioning"""
+        return self._extract_section_by_header(
+            page,
+            header_keywords=['MAKLUMAT', 'WARIS'],
+            field_labels=WARIS_FIELD_LABELS,
+            next_section_keywords=None
+        )
+
+    def extract_pasangan_section(self, page):
+        """Extract MAKLUMAT PASANGAN using header-based positioning"""
+        return self._extract_section_by_header(
+            page,
+            header_keywords=['MAKLUMAT', 'PASANGAN'],
+            field_labels=PASANGAN_FIELD_LABELS,
+            next_section_keywords=['ANAK', 'WARIS']
+        )
+
+
+    def _load_template_by_status(self, page, working_fields: Dict, has_v2_border: bool) -> Dict:
+        """Load appropriate template based on status_perkahwinan
+
+        Returns:
+            Updated working_fields dict
+        """
+        # Quick extraction of status_perkahwinan to determine template
+        status_perkahwinan = ""
+        if 'status_perkahwinan' in working_fields:
+            status_box = working_fields['status_perkahwinan']
+            status_perkahwinan = self.extract_text_from_box(page, status_box).upper()
+
+        # Determine which template to use
+        if 'KAHWIN' in status_perkahwinan:
+            template_to_use = "app/templates/template_with_pasangan.json"
+        else:
+            template_to_use = "app/templates/template_without_pasangan.json"
+
+        # Reload appropriate template if different
+        if template_to_use != self.template_path:
+            self.load_template(template_to_use)
+            # Re-create working copy with new template
+            working_fields = copy.deepcopy(self.fields)
+            # Re-apply v2 offset to new template if needed
+            if has_v2_border:
+                for field_name, box in working_fields.items():
+                    box['x'] += V2_OFFSET_X
+                    box['y'] += V2_OFFSET_Y
+
+        return working_fields
+
+    def _calculate_section_offsets(self, pdf, page, has_v2_border: bool) -> Tuple[Dict[str, int], Any, bool]:
+        """Calculate section offsets and determine waris page
+
+        Returns:
+            Tuple of (offsets_dict, waris_page, waris_exists)
+        """
+        page_count = len(pdf.pages)
+
+        # For v2 format, skip auto-offset detection (use fixed offset already applied)
+        # Exception: WARIS needs dynamic offset due to variable ANAK section length
+        # For v1 format, use auto-offset detection
+        if has_v2_border:
+            # For waris in v2: detected offset includes v2 border shift, so subtract it
+            # to avoid double-counting (detected offset - v2_offset = additional offset for variable ANAK content)
+            waris_detected_offset = self.detect_section_offset(page, 'maklumat_waris_header', page_count)
+
+            # Only apply adjustment if header was actually found (distinguish None from 0)
+            if waris_detected_offset is not None:
+                waris_adjusted_offset = waris_detected_offset - int(V2_OFFSET_Y)
+            else:
+                waris_adjusted_offset = None  # Header not found on page 1
+
+            offsets = {
+                'pemohon': 0,
+                'pasangan': 0,
+                'anak': 0,
+                'waris': waris_adjusted_offset
+            }
+        else:
+            # Detect section offsets using header anchors (v1 format only)
+            offsets = {
+                'pemohon': self.detect_section_offset(page, 'maklumat_pemohon_header', page_count),
+                'pasangan': self.detect_section_offset(page, 'maklumat_pasangan_header', page_count),
+                'anak': self.detect_section_offset(page, 'maklumat_anak_header', page_count),
+                'waris': self.detect_section_offset(page, 'maklumat_waris_header', page_count)
+            }
+
+        # Check if WARIS section exists on page 1
+        waris_exists = offsets['waris'] is not None
+        waris_page = page  # Default to page 1
+
+        # If waris not found on page 1 and there's a page 2, check page 2
+        if not waris_exists and page_count > 1:
+            page_2 = pdf.pages[1]
+            waris_offset_page2 = self.detect_section_offset(page_2, 'maklumat_waris_header', page_count)
+            if waris_offset_page2 is not None:
+                waris_exists = True
+                # Apply v2 adjustment (same logic as page 1 WARIS)
+                if has_v2_border:
+                    offsets['waris'] = waris_offset_page2 - int(V2_OFFSET_Y)
+                else:
+                    offsets['waris'] = waris_offset_page2
+                waris_page = page_2
+
+        return offsets, waris_page, waris_exists
+
+    def _extract_all_fields(self, working_fields: Dict, page, offsets: Dict,
+                           waris_page, waris_exists: bool) -> Tuple[Dict, Dict, Dict]:
+        """Extract all fields from bounding boxes with section-specific offsets
+
+        Returns:
+            Tuple of (all_fields, pasangan_fields, waris_fields)
+        """
+        all_fields = {}
+        pasangan_fields = {}
+        waris_fields = {}
+
+        for field_name, box in working_fields.items():
+            # Skip header fields (not actual data)
+            if field_name.endswith('_header'):
+                continue
+
+            # Skip waris fields if waris section doesn't exist
+            if field_name.startswith('waris_') and not waris_exists:
+                continue
+
+            # Determine section-specific offset and page to extract from
+            if field_name.startswith('waris_'):
+                offset = offsets['waris'] if offsets['waris'] is not None else 0
+                extract_page = waris_page
+            elif field_name.startswith('pasangan_'):
+                offset = offsets['pasangan']
+                extract_page = page
+            elif field_name.startswith('anak_'):
+                offset = offsets['anak']
+                extract_page = page
+            else:
+                # Main applicant section (MAKLUMAT PEMOHON)
+                offset = offsets['pemohon']
+                extract_page = page
+
+            # Determine field-specific tolerance (jantina needs tighter tolerance)
+            tolerance = TOLERANCE_TIGHT if field_name == 'jantina' else TOLERANCE_DEFAULT
+
+            # Extract with section offset and field-specific tolerance
+            text = self.extract_text_from_box(extract_page, box, y_offset=offset, tolerance=tolerance)
+
+            # Group fields by prefix
+            if field_name.startswith('pasangan_'):
+                clean_name = field_name.replace('pasangan_', '')
+                pasangan_fields[clean_name] = text
+            elif field_name.startswith('waris_'):
+                clean_name = field_name.replace('waris_', '')
+                waris_fields[clean_name] = text
+            else:
+                all_fields[field_name] = text
+
+        return all_fields, pasangan_fields, waris_fields
 
     def extract_from_pdf(self, pdf_path):
         """Extract all fields from a PDF with two-stage template selection"""
         # Detect if this is v2 format (with black border)
         working_pdf_path, has_v2_border, temp_file = crop_pdf_if_needed(pdf_path, dpi=150)
-
-        # v2 format offset (compared to v1 format)
-        V2_OFFSET_X = 28.34
-        V2_OFFSET_Y = 28.34
 
         try:
             with pdfplumber.open(working_pdf_path) as pdf:
@@ -404,103 +475,16 @@ class STRExtractor:
                         box['x'] += V2_OFFSET_X
                         box['y'] += V2_OFFSET_Y
 
-                # STAGE 1: Quick extraction of status_perkahwinan to determine template
-                status_perkahwinan = ""
-                if 'status_perkahwinan' in working_fields:
-                    status_box = working_fields['status_perkahwinan']
-                    status_perkahwinan = self.extract_text_from_box(page, status_box).upper()
+                # STAGE 1: Load appropriate template based on status_perkahwinan
+                working_fields = self._load_template_by_status(page, working_fields, has_v2_border)
 
-                # Determine which template to use
-                if 'KAHWIN' in status_perkahwinan:
-                    template_to_use = "app/templates/template_with_pasangan.json"
-                else:
-                    template_to_use = "app/templates/template_without_pasangan.json"
+                # STAGE 2: Calculate section offsets
+                offsets, waris_page, waris_exists = self._calculate_section_offsets(pdf, page, has_v2_border)
 
-                # STAGE 2: Reload appropriate template and extract all fields
-                if template_to_use != self.template_path:
-                    self.load_template(template_to_use)
-                    # Re-create working copy with new template
-                    working_fields = copy.deepcopy(self.fields)
-                    # Re-apply v2 offset to new template if needed
-                    if has_v2_border:
-                        for field_name, box in working_fields.items():
-                            box['x'] += V2_OFFSET_X
-                            box['y'] += V2_OFFSET_Y
-
-                # Get total page count for smart header detection
-                page_count = len(pdf.pages)
-
-                # For v2 format, skip auto-offset detection (use fixed offset already applied)
-                # For v1 format, use auto-offset detection
-                if has_v2_border:
-                    pemohon_offset = 0
-                    pasangan_offset = 0
-                    anak_offset = 0
-                    waris_offset = 0
-                else:
-                    # Detect section offsets using header anchors (v1 format only)
-                    pemohon_offset = self.detect_section_offset(page, 'maklumat_pemohon_header', page_count)
-                    pasangan_offset = self.detect_section_offset(page, 'maklumat_pasangan_header', page_count)
-                    anak_offset = self.detect_section_offset(page, 'maklumat_anak_header', page_count)
-                    waris_offset = self.detect_section_offset(page, 'maklumat_waris_header', page_count)
-
-                # Check if WARIS section exists on page 1
-                waris_exists = waris_offset is not None
-                waris_page = page  # Default to page 1
-
-                # If waris not found on page 1 and there's a page 2, check page 2
-                if not waris_exists and page_count > 1:
-                    page_2 = pdf.pages[1]
-                    waris_offset_page2 = self.detect_section_offset(page_2, 'maklumat_waris_header', page_count)
-                    if waris_offset_page2 is not None:
-                        waris_exists = True
-                        waris_offset = waris_offset_page2
-                        waris_page = page_2
-
-                # Extract all fields from bounding boxes with section-specific offsets
-                all_fields = {}
-                pasangan_fields = {}
-                waris_fields = {}
-
-                for field_name, box in working_fields.items():
-                    # Skip header fields (not actual data)
-                    if field_name.endswith('_header'):
-                        continue
-
-                    # Skip waris fields if waris section doesn't exist
-                    if field_name.startswith('waris_') and not waris_exists:
-                        continue
-
-                    # Determine section-specific offset and page to extract from
-                    if field_name.startswith('waris_'):
-                        offset = waris_offset if waris_offset is not None else 0
-                        extract_page = waris_page
-                    elif field_name.startswith('pasangan_'):
-                        offset = pasangan_offset
-                        extract_page = page
-                    elif field_name.startswith('anak_'):
-                        offset = anak_offset
-                        extract_page = page
-                    else:
-                        # Main applicant section (MAKLUMAT PEMOHON)
-                        offset = pemohon_offset
-                        extract_page = page
-
-                    # Determine field-specific tolerance (jantina needs tighter tolerance)
-                    tolerance = 3 if field_name == 'jantina' else 5
-
-                    # Extract with section offset and field-specific tolerance
-                    text = self.extract_text_from_box(extract_page, box, y_offset=offset, tolerance=tolerance)
-
-                    # Group fields by prefix
-                    if field_name.startswith('pasangan_'):
-                        clean_name = field_name.replace('pasangan_', '')
-                        pasangan_fields[clean_name] = text
-                    elif field_name.startswith('waris_'):
-                        clean_name = field_name.replace('waris_', '')
-                        waris_fields[clean_name] = text
-                    else:
-                        all_fields[field_name] = text
+                # STAGE 3: Extract all fields
+                all_fields, pasangan_fields, waris_fields = self._extract_all_fields(
+                    working_fields, page, offsets, waris_page, waris_exists
+                )
 
                 # Extract MAKLUMAT ANAK table (always on page 1)
                 children = self.extract_anak_table(page)
@@ -513,212 +497,8 @@ class STRExtractor:
 
                 return structured_data
         finally:
-            # Clean up temporary file if created (no-op now)
-            if temp_file:
-                cleanup_temp_file(temp_file)
+            pass  # No cleanup needed anymore
 
-    def clean_age_field(self, age_text: str) -> str:
-        """Clean age field by removing text after TAHUN
-
-        Args:
-            age_text: Raw age text (e.g., "51 TAHUN LELAKI")
-
-        Returns:
-            Cleaned age text (e.g., "51 TAHUN")
-        """
-        if not age_text:
-            return ""
-
-        # Extract only the number + TAHUN part using regex
-        match = re.search(r'(\d+\s*TAHUN)', age_text.upper())
-        if match:
-            return match.group(1)
-
-        return age_text
-
-    def clean_remove_section_labels(self, text: str) -> str:
-        """Remove section labels like 'Pemohon', 'Pasangan', 'Waris' from text
-
-        Args:
-            text: Raw text that may contain section labels
-
-        Returns:
-            Cleaned text with section labels removed
-        """
-        if not text:
-            return ""
-
-        # Remove "Pemohon" and everything after it (case-insensitive)
-        # This handles cases like "W.P. KUALA LUMPUR Pemohon"
-        cleaned = re.sub(r'\s*Pemohon.*$', '', text, flags=re.IGNORECASE)
-
-        # Also remove other section labels
-        cleaned = re.sub(r'\s*Pasangan.*$', '', cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r'\s*Waris.*$', '', cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r'\s*Anak.*$', '', cleaned, flags=re.IGNORECASE)
-
-        # Clean up extra whitespace and commas
-        cleaned = cleaned.strip().rstrip(',').strip()
-
-        return cleaned
-
-    def clean_postal_code(self, postal_text: str) -> str:
-        """Extract only numbers from postal code field
-
-        Args:
-            postal_text: Raw postal code text that may contain alphabets
-
-        Returns:
-            Only numeric characters, empty string if no numbers found
-        """
-        if not postal_text:
-            return ""
-
-        # Extract only digits
-        numbers_only = re.sub(r'[^\d]', '', postal_text)
-
-        return numbers_only
-
-    def clean_remove_numbers(self, text: str) -> str:
-        """Remove all numbers from text
-
-        Args:
-            text: Raw text that may contain numbers
-
-        Returns:
-            Text with numbers removed, cleaned whitespace
-        """
-        if not text:
-            return ""
-
-        # Remove all digits
-        no_numbers = re.sub(r'\d+', '', text)
-
-        # Clean up extra whitespace
-        cleaned = ' '.join(no_numbers.split()).strip()
-
-        return cleaned
-
-    def clean_remove_whitespace(self, text: str) -> str:
-        """Remove all whitespace from text
-
-        Args:
-            text: Raw text that may contain spaces (e.g., "g mail.com")
-
-        Returns:
-            Text with all whitespace removed (e.g., "gmail.com")
-        """
-        if not text:
-            return ""
-
-        # Remove all whitespace characters
-        no_spaces = re.sub(r'\s+', '', text)
-
-        return no_spaces
-
-    def clean_remove_trailing_rm(self, text: str) -> str:
-        """Remove trailing 'RM' from text
-
-        Args:
-            text: Raw text that may have trailing "RM"
-
-        Returns:
-            Text with trailing "RM" removed
-        """
-        if not text:
-            return ""
-
-        # Remove trailing "RM" (case-insensitive)
-        cleaned = re.sub(r'\s*RM\s*$', '', text, flags=re.IGNORECASE)
-
-        return cleaned.strip()
-
-    def clean_numbers_only(self, text: str) -> str:
-        """Extract only numeric digits from text
-
-        Args:
-            text: Raw text that may contain non-numeric characters
-
-        Returns:
-            Only numeric characters
-        """
-        if not text:
-            return ""
-
-        # Extract only digits
-        numbers_only = re.sub(r'[^\d]', '', text)
-
-        return numbers_only
-
-    def clean_jantina_field(self, jantina_text: str) -> str:
-        """Extract only the gender word (LELAKI or PEREMPUAN) from jantina field
-
-        Args:
-            jantina_text: Raw jantina text (e.g., "PEREMPUAN TIDAK BEKERJA")
-
-        Returns:
-            Only the gender word (e.g., "PEREMPUAN")
-        """
-        if not jantina_text:
-            return ""
-
-        # Convert to uppercase for matching
-        text_upper = jantina_text.upper()
-
-        # Extract only LELAKI or PEREMPUAN (first occurrence)
-        if 'PEREMPUAN' in text_upper:
-            return 'PEREMPUAN'
-        elif 'LELAKI' in text_upper:
-            return 'LELAKI'
-
-        # If neither found, remove numbers and return cleaned text
-        letters_only = re.sub(r'[^a-zA-Z\s]', '', jantina_text)
-        cleaned = ' '.join(letters_only.split()).strip()
-        return cleaned
-
-    def clean_alphabets_only(self, text: str) -> str:
-        """Keep only alphabetic characters and spaces
-
-        Args:
-            text: Raw text that may contain numbers or special characters
-
-        Returns:
-            Only alphabetic characters with spaces
-        """
-        if not text:
-            return ""
-
-        # Remove all non-letter characters except spaces
-        letters_only = re.sub(r'[^a-zA-Z\s]', '', text)
-
-        # Clean up extra whitespace
-        cleaned = ' '.join(letters_only.split()).strip()
-
-        return cleaned
-
-    def clean_mykad_number(self, mykad_text: str) -> str:
-        """Clean MyKad number - keep only first 12 digits before whitespace
-
-        Args:
-            mykad_text: Raw MyKad text (e.g., "740307015359 51")
-
-        Returns:
-            Only first 12 digits (e.g., "740307015359")
-        """
-        if not mykad_text:
-            return ""
-
-        # Remove everything after whitespace
-        text_before_space = mykad_text.split()[0] if mykad_text.split() else mykad_text
-
-        # Extract only digits
-        digits_only = re.sub(r'[^\d]', '', text_before_space)
-
-        # Keep only first 12 digits
-        if len(digits_only) >= 12:
-            return digits_only[:12]
-
-        return digits_only
 
     def smart_combine_address(self, alamat_surat: str, poskod: str,
                              bandar_daerah: str, negeri: str) -> str:
@@ -736,13 +516,13 @@ class STRExtractor:
         if not alamat_surat:
             alamat_surat = ""
 
-        # Normalize for comparison (uppercase, remove extra spaces)
+        # Normalize for comparison
         alamat_upper = ' '.join(alamat_surat.upper().split())
 
         # Clean individual components
-        poskod_clean = self.clean_postal_code(poskod) if poskod else ""
-        bandar_clean = self.clean_remove_numbers(bandar_daerah) if bandar_daerah else ""
-        negeri_clean = self.clean_remove_section_labels(negeri) if negeri else ""
+        poskod_clean = extract_postal_code(poskod) if poskod else ""
+        bandar_clean = remove_numbers(bandar_daerah) if bandar_daerah else ""
+        negeri_clean = remove_section_labels(negeri) if negeri else ""
 
         # Components to potentially add
         parts_to_add = []
@@ -752,50 +532,17 @@ class STRExtractor:
             parts_to_add.append(poskod_clean)
 
         # Check if district is already in alamat_surat
-        # Handle partial matches (e.g., "KUALA LUMPUR" in "W.P. KUALA LUMPUR")
         if bandar_clean:
             bandar_normalized = ' '.join(bandar_clean.upper().split())
-            # Check if district name (or significant part) is in address
             if bandar_normalized not in alamat_upper:
-                # Also check if key words from district are present
                 bandar_words = set(bandar_normalized.split())
                 alamat_words = set(alamat_upper.split())
-                # If less than half the words are present, add the district
                 if len(bandar_words & alamat_words) < len(bandar_words) * 0.5:
                     parts_to_add.append(bandar_clean)
 
-        # Check if state is already in alamat_surat
-        # Handle variations like "W.P." vs "WILAYAH PERSEKUTUAN"
-        if negeri_clean:
-            negeri_normalized = ' '.join(negeri_clean.upper().split())
-
-            # State abbreviations mapping
-            state_variations = {
-                'W.P.': ['WILAYAH PERSEKUTUAN', 'WP', 'W.P.', 'W.P'],
-                'WILAYAH PERSEKUTUAN': ['W.P.', 'WP', 'WILAYAH PERSEKUTUAN'],
-                'KUALA LUMPUR': ['KL', 'K.L.', 'KUALA LUMPUR'],
-                'SELANGOR': ['SELANGOR', 'SEL'],
-                'PULAU PINANG': ['PULAU PINANG', 'PENANG', 'P.PINANG'],
-                'JOHOR': ['JOHOR', 'JHR'],
-                'MELAKA': ['MELAKA', 'MALACCA', 'MLK'],
-            }
-
-            # Check if any variation of the state is already present
-            state_found = False
-            for state_key, variations in state_variations.items():
-                if any(keyword in negeri_normalized for keyword in [state_key]):
-                    # Check if any variation is in alamat_surat
-                    if any(var in alamat_upper for var in variations):
-                        state_found = True
-                        break
-
-            # If state not found in any form, check direct match
-            if not state_found and negeri_normalized not in alamat_upper:
-                # Also check word overlap
-                negeri_words = set(negeri_normalized.split())
-                alamat_words = set(alamat_upper.split())
-                if len(negeri_words & alamat_words) < len(negeri_words) * 0.5:
-                    parts_to_add.append(negeri_clean)
+        # Check if state is already in alamat_surat using utility function
+        if negeri_clean and not is_state_in_address(negeri_clean, alamat_surat):
+            parts_to_add.append(negeri_clean)
 
         # Combine: start with alamat_surat, then add missing parts
         result_parts = [alamat_surat] if alamat_surat else []
@@ -804,10 +551,8 @@ class STRExtractor:
         # Join with comma and clean up
         combined = ', '.join(part for part in result_parts if part)
 
-        # Final cleanup: remove section labels
-        combined = self.clean_remove_section_labels(combined)
-
-        # Clean up multiple consecutive commas and extra spaces
+        # Final cleanup
+        combined = remove_section_labels(combined)
         combined = re.sub(r',\s*,+', ',', combined)
         combined = re.sub(r'\s+', ' ', combined).strip()
         combined = combined.strip(',').strip()
@@ -828,24 +573,24 @@ class STRExtractor:
 
         structured = {
             'document_info': {
-                'type': 'Sumbangan Tunai Rahmah (STR)',
+                'type': DOCUMENT_TYPE,
                 'tarikh_cetak': pemohon_fields.get('tarikh_cetak', ''),
                 'extraction_date': datetime.now().isoformat(),
-                'extraction_version': 'v3.0-template-based'
+                'extraction_version': EXTRACTION_VERSION
             },
             'pemohon': {
                 'nama': pemohon_fields.get('nama', ''),
-                'no_mykad': self.clean_mykad_number(pemohon_fields.get('no_mykad', '')),
-                'umur': self.clean_age_field(pemohon_fields.get('umur', '')),
-                'jantina': self.clean_jantina_field(pemohon_fields.get('jantina', '')),
+                'no_mykad': clean_mykad_number(pemohon_fields.get('no_mykad', '')),
+                'umur': clean_age_field(pemohon_fields.get('umur', '')),
+                'jantina': clean_jantina_field(pemohon_fields.get('jantina', '')),
                 'alamat': full_address,
-                'poskod': self.clean_postal_code(pemohon_fields.get('poskod', '')),
-                'bandar_daerah': self.clean_remove_numbers(pemohon_fields.get('bandar_daerah', '')),
-                'negeri': self.clean_remove_section_labels(pemohon_fields.get('negeri', '')),
+                'poskod': extract_postal_code(pemohon_fields.get('poskod', '')),
+                'bandar_daerah': remove_numbers(pemohon_fields.get('bandar_daerah', '')),
+                'negeri': remove_section_labels(pemohon_fields.get('negeri', '')),
                 'telefon_bimbit': pemohon_fields.get('no_telefon_bimbit', ''),
                 'telefon_rumah': pemohon_fields.get('no_telefon_rumah', ''),
-                'email': self.clean_remove_whitespace(pemohon_fields.get('alamat_emel', '')),
-                'pekerjaan': self.clean_remove_trailing_rm(pemohon_fields.get('pekerjaan', '')),
+                'email': remove_whitespace(pemohon_fields.get('alamat_emel', '')),
+                'pekerjaan': remove_trailing_rm(pemohon_fields.get('pekerjaan', '')),
                 'pendapatan_bulanan': pemohon_fields.get('pendapatan_kasar', ''),
                 'status_perkahwinan': pemohon_fields.get('status_perkahwinan', ''),
                 'tarikh_perkahwinan': pemohon_fields.get('tarikh_perkahwinan', ''),
@@ -857,9 +602,9 @@ class STRExtractor:
             'pasangan': {
                 'nama': pasangan_fields.get('nama', ''),
                 'no_mykad': pasangan_fields.get('no_mykad', ''),
-                'telefon': self.clean_numbers_only(pasangan_fields.get('no_telefon', '')),
-                'jantina': self.clean_jantina_field(pasangan_fields.get('jantina', '')),
-                'pekerjaan': self.clean_remove_section_labels(pasangan_fields.get('pekerjaan', '')),
+                'telefon': extract_numbers_only(pasangan_fields.get('no_telefon', '')),
+                'jantina': clean_jantina_field(pasangan_fields.get('jantina', '')),
+                'pekerjaan': remove_section_labels(pasangan_fields.get('pekerjaan', '')),
                 'bank': {
                     'nama_bank': pasangan_fields.get('nama_bank', ''),
                     'no_akaun': pasangan_fields.get('no_akaun_bank', '')
@@ -867,10 +612,10 @@ class STRExtractor:
             },
             'anak_anak': children,
             'waris': {
-                'hubungan': self.clean_alphabets_only(waris_fields.get('hubungan', '')),
-                'no_pengenalan': self.clean_numbers_only(waris_fields.get('no_pengenalan', '')),
-                'nama': self.clean_alphabets_only(waris_fields.get('nama', '')),
-                'telefon': self.clean_numbers_only(waris_fields.get('no_telefon', ''))
+                'hubungan': extract_alphabets_only(waris_fields.get('hubungan', '')),
+                'no_pengenalan': extract_numbers_only(waris_fields.get('no_pengenalan', '')),
+                'nama': extract_alphabets_only(waris_fields.get('nama', '')),
+                'telefon': extract_numbers_only(waris_fields.get('no_telefon', ''))
             }
         }
 
@@ -887,8 +632,16 @@ class STRExtractor:
                 items.append((new_key, v))
         return dict(items)
 
-    def format_details_column(self, data: Dict[str, Any]) -> str:
-        """Format all data into a single multiline text column for Details"""
+    def _format_details(self, data: Dict[str, Any], include_full_data: bool = True) -> str:
+        """Format data into multiline text column
+
+        Args:
+            data: Structured data dictionary
+            include_full_data: If True, include all sections; if False, only numbered fields (1-13)
+
+        Returns:
+            Formatted multiline string
+        """
         lines = []
 
         # Get data sections
@@ -896,7 +649,7 @@ class STRExtractor:
         pasangan = data.get('pasangan', {})
         waris = data.get('waris', {})
 
-        # Section 1: Numbered minimal fields (1-13)
+        # Section 1: Numbered minimal fields (1-13) - always included
         lines.append(f"(1) NAME :- {pemohon.get('nama', '')}")
         lines.append(f"(2) IC :- {pemohon.get('no_mykad', '')}")
         lines.append(f"(3) PH1 :- {pemohon.get('telefon_bimbit', '')}")
@@ -910,62 +663,47 @@ class STRExtractor:
         lines.append(f"(11) REL-NAME :- {waris.get('nama', '')}")
         lines.append(f"(12) REL-PH1 :- {waris.get('telefon', '')}")
         lines.append(f"(13) EMAIL :- {pemohon.get('email', '')}")
-        lines.append("----------------------------")
 
-        # Section 2: All pemohon fields with prefix
-        if 'pemohon' in data:
-            pemohon_flat = self.flatten_dict(data['pemohon'])
-            for key, value in pemohon_flat.items():
-                lines.append(f"pemohon_{key} :- {value}")
-        lines.append("------------------")
+        # Only add full data sections if requested
+        if include_full_data:
+            lines.append("----------------------------")
 
-        # Section 3: All pasangan fields with prefix
-        if 'pasangan' in data:
-            pasangan_flat = self.flatten_dict(data['pasangan'])
-            for key, value in pasangan_flat.items():
-                lines.append(f"pasangan_{key} :- {value}")
-        lines.append("------------------")
+            # Section 2: All pemohon fields with prefix
+            if 'pemohon' in data:
+                pemohon_flat = self.flatten_dict(data['pemohon'])
+                for key, value in pemohon_flat.items():
+                    lines.append(f"pemohon_{key} :- {value}")
+            lines.append("------------------")
 
-        # Section 4: All waris fields with prefix
-        if 'waris' in data:
-            waris_flat = self.flatten_dict(data['waris'])
-            for key, value in waris_flat.items():
-                lines.append(f"waris_{key} :- {value}")
-        lines.append("------------------")
+            # Section 3: All pasangan fields with prefix
+            if 'pasangan' in data:
+                pasangan_flat = self.flatten_dict(data['pasangan'])
+                for key, value in pasangan_flat.items():
+                    lines.append(f"pasangan_{key} :- {value}")
+            lines.append("------------------")
 
-        # Section 5: All anak fields
-        if 'anak_anak' in data and data['anak_anak']:
-            for i, child in enumerate(data['anak_anak'], 1):
-                for key, value in child.items():
-                    lines.append(f"anak_{i}_{key} :- {value}")
+            # Section 4: All waris fields with prefix
+            if 'waris' in data:
+                waris_flat = self.flatten_dict(data['waris'])
+                for key, value in waris_flat.items():
+                    lines.append(f"waris_{key} :- {value}")
+            lines.append("------------------")
+
+            # Section 5: All anak fields
+            if 'anak_anak' in data and data['anak_anak']:
+                for i, child in enumerate(data['anak_anak'], 1):
+                    for key, value in child.items():
+                        lines.append(f"anak_{i}_{key} :- {value}")
 
         return '\n'.join(lines)
+
+    def format_details_column(self, data: Dict[str, Any]) -> str:
+        """Format all data into a single multiline text column for Details"""
+        return self._format_details(data, include_full_data=True)
 
     def format_minimal_details_column(self, data: Dict[str, Any]) -> str:
         """Format only the first 13 numbered items for Minimal Detail column"""
-        lines = []
-
-        # Get data sections
-        pemohon = data.get('pemohon', {})
-        pasangan = data.get('pasangan', {})
-        waris = data.get('waris', {})
-
-        # Only the numbered minimal fields (1-13)
-        lines.append(f"(1) NAME :- {pemohon.get('nama', '')}")
-        lines.append(f"(2) IC :- {pemohon.get('no_mykad', '')}")
-        lines.append(f"(3) PH1 :- {pemohon.get('telefon_bimbit', '')}")
-        lines.append(f"(4) PH2 :- {pemohon.get('telefon_rumah', '')}")
-        lines.append(f"(5) ADDRESS :- {pemohon.get('alamat', '')}")
-        lines.append(f"(6) SPOUSE IC :- {pasangan.get('no_mykad', '')}")
-        lines.append(f"(7) SPOUSE NAME :- {pasangan.get('nama', '')}")
-        lines.append(f"(8) SPOUSE PH :- {pasangan.get('telefon', '')}")
-        lines.append(f"(9) RELATION :- {waris.get('hubungan', '')}")
-        lines.append(f"(10) REL-IC :- {waris.get('no_pengenalan', '')}")
-        lines.append(f"(11) REL-NAME :- {waris.get('nama', '')}")
-        lines.append(f"(12) REL-PH1 :- {waris.get('telefon', '')}")
-        lines.append(f"(13) EMAIL :- {pemohon.get('email', '')}")
-
-        return '\n'.join(lines)
+        return self._format_details(data, include_full_data=False)
 
     def to_excel_row(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Convert structured data to flat row for Excel"""

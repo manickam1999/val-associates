@@ -9,6 +9,7 @@ import pandas as pd
 from pathlib import Path
 from typing import List, Dict, Any, Callable
 from .str_extractor import STRExtractor
+from .config.constants import STRING_COLUMN_PATTERNS, EXCEL_SHEET_NAME
 
 
 class BatchProcessor:
@@ -125,19 +126,14 @@ class BatchProcessor:
         df = df[ordered_columns]
 
         # Convert numeric-looking text columns to string to prevent Excel auto-formatting
-        string_column_patterns = [
-            'IC', 'PH', 'no_mykad', 'no_mykid', 'telefon',
-            'poskod', 'no_akaun', 'no_pengenalan'
-        ]
-
         for col in df.columns:
             # Check if column name matches any pattern
-            if any(pattern in col for pattern in string_column_patterns):
+            if any(pattern in col for pattern in STRING_COLUMN_PATTERNS):
                 # Convert to string and replace 'nan' with empty string
                 df[col] = df[col].fillna('').astype(str)
                 df[col] = df[col].replace('nan', '')
 
         # Save to Excel
-        df.to_excel(output_path, sheet_name='STR_Data', index=False, engine='openpyxl')
+        df.to_excel(output_path, sheet_name=EXCEL_SHEET_NAME, index=False, engine='openpyxl')
 
         return len(rows)
