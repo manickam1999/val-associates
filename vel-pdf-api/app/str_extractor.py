@@ -6,10 +6,12 @@ Based on reference/extract_str.py with Excel output capabilities
 
 import json
 import re
+import copy
 import pdfplumber
 from pathlib import Path
 from typing import Dict, List, Any
 from datetime import datetime
+from .pdf_cropper import crop_pdf_if_needed, cleanup_temp_file
 
 
 class STRExtractor:
@@ -382,97 +384,138 @@ class STRExtractor:
 
     def extract_from_pdf(self, pdf_path):
         """Extract all fields from a PDF with two-stage template selection"""
-        with pdfplumber.open(pdf_path) as pdf:
-            page = pdf.pages[0]  # First page for main data
+        # Detect if this is v2 format (with black border)
+        working_pdf_path, has_v2_border, temp_file = crop_pdf_if_needed(pdf_path, dpi=150)
 
-            # STAGE 1: Quick extraction of status_perkahwinan to determine template
-            status_perkahwinan = ""
-            if 'status_perkahwinan' in self.fields:
-                status_box = self.fields['status_perkahwinan']
-                status_perkahwinan = self.extract_text_from_box(page, status_box).upper()
+        # v2 format offset (compared to v1 format)
+        V2_OFFSET_X = 28.34
+        V2_OFFSET_Y = 28.34
 
-            # Determine which template to use
-            if 'KAHWIN' in status_perkahwinan:
-                template_to_use = "app/templates/template_with_pasangan.json"
-            else:
-                template_to_use = "app/templates/template_without_pasangan.json"
+        try:
+            with pdfplumber.open(working_pdf_path) as pdf:
+                page = pdf.pages[0]  # First page for main data
 
-            # STAGE 2: Reload appropriate template and extract all fields
-            if template_to_use != self.template_path:
-                self.load_template(template_to_use)
+                # Create a working copy of fields to avoid mutating the original template
+                working_fields = copy.deepcopy(self.fields)
 
-            # Get total page count for smart header detection
-            page_count = len(pdf.pages)
+                # If v2 format, apply offset to working copy
+                if has_v2_border:
+                    for field_name, box in working_fields.items():
+                        box['x'] += V2_OFFSET_X
+                        box['y'] += V2_OFFSET_Y
 
-            # Detect section offsets using header anchors
-            pemohon_offset = self.detect_section_offset(page, 'maklumat_pemohon_header', page_count)
-            pasangan_offset = self.detect_section_offset(page, 'maklumat_pasangan_header', page_count)
-            anak_offset = self.detect_section_offset(page, 'maklumat_anak_header', page_count)
-            waris_offset = self.detect_section_offset(page, 'maklumat_waris_header', page_count)
+                # STAGE 1: Quick extraction of status_perkahwinan to determine template
+                status_perkahwinan = ""
+                if 'status_perkahwinan' in working_fields:
+                    status_box = working_fields['status_perkahwinan']
+                    status_perkahwinan = self.extract_text_from_box(page, status_box).upper()
 
-            # Check if WARIS section exists on page 1
-            waris_exists = waris_offset is not None
-            waris_page = page  # Default to page 1
-
-            # If waris not found on page 1 and there's a page 2, check page 2
-            if not waris_exists and page_count > 1:
-                page_2 = pdf.pages[1]
-                waris_offset_page2 = self.detect_section_offset(page_2, 'maklumat_waris_header', page_count)
-                if waris_offset_page2 is not None:
-                    waris_exists = True
-                    waris_offset = waris_offset_page2
-                    waris_page = page_2
-
-            # Extract all fields from bounding boxes with section-specific offsets
-            all_fields = {}
-            pasangan_fields = {}
-            waris_fields = {}
-
-            for field_name, box in self.fields.items():
-                # Skip header fields (not actual data)
-                if field_name.endswith('_header'):
-                    continue
-
-                # Skip waris fields if waris section doesn't exist
-                if field_name.startswith('waris_') and not waris_exists:
-                    continue
-
-                # Determine section-specific offset and page to extract from
-                if field_name.startswith('waris_'):
-                    offset = waris_offset if waris_offset is not None else 0
-                    extract_page = waris_page
-                elif field_name.startswith('pasangan_'):
-                    offset = pasangan_offset
-                    extract_page = page
-                elif field_name.startswith('anak_'):
-                    offset = anak_offset
-                    extract_page = page
+                # Determine which template to use
+                if 'KAHWIN' in status_perkahwinan:
+                    template_to_use = "app/templates/template_with_pasangan.json"
                 else:
-                    # Main applicant section (MAKLUMAT PEMOHON)
-                    offset = pemohon_offset
-                    extract_page = page
+                    template_to_use = "app/templates/template_without_pasangan.json"
 
-                # Determine field-specific tolerance (jantina needs tighter tolerance)
-                tolerance = 3 if field_name == 'jantina' else 5
+                # STAGE 2: Reload appropriate template and extract all fields
+                if template_to_use != self.template_path:
+                    self.load_template(template_to_use)
+                    # Re-create working copy with new template
+                    working_fields = copy.deepcopy(self.fields)
+                    # Re-apply v2 offset to new template if needed
+                    if has_v2_border:
+                        for field_name, box in working_fields.items():
+                            box['x'] += V2_OFFSET_X
+                            box['y'] += V2_OFFSET_Y
 
-                # Extract with section offset and field-specific tolerance
-                text = self.extract_text_from_box(extract_page, box, y_offset=offset, tolerance=tolerance)
+                # Get total page count for smart header detection
+                page_count = len(pdf.pages)
 
-                # Group fields by prefix
-                if field_name.startswith('pasangan_'):
-                    clean_name = field_name.replace('pasangan_', '')
-                    pasangan_fields[clean_name] = text
-                elif field_name.startswith('waris_'):
-                    clean_name = field_name.replace('waris_', '')
-                    waris_fields[clean_name] = text
+                # For v2 format, skip auto-offset detection (use fixed offset already applied)
+                # For v1 format, use auto-offset detection
+                if has_v2_border:
+                    pemohon_offset = 0
+                    pasangan_offset = 0
+                    anak_offset = 0
+                    waris_offset = 0
                 else:
-                    all_fields[field_name] = text
+                    # Detect section offsets using header anchors (v1 format only)
+                    pemohon_offset = self.detect_section_offset(page, 'maklumat_pemohon_header', page_count)
+                    pasangan_offset = self.detect_section_offset(page, 'maklumat_pasangan_header', page_count)
+                    anak_offset = self.detect_section_offset(page, 'maklumat_anak_header', page_count)
+                    waris_offset = self.detect_section_offset(page, 'maklumat_waris_header', page_count)
 
-            # Extract MAKLUMAT ANAK table (always on page 1)
-            children = self.extract_anak_table(page)
+                # Check if WARIS section exists on page 1
+                waris_exists = waris_offset is not None
+                waris_page = page  # Default to page 1
 
-            # Structure the data
-            return self.structure_data(all_fields, pasangan_fields, waris_fields, children)
+                # If waris not found on page 1 and there's a page 2, check page 2
+                if not waris_exists and page_count > 1:
+                    page_2 = pdf.pages[1]
+                    waris_offset_page2 = self.detect_section_offset(page_2, 'maklumat_waris_header', page_count)
+                    if waris_offset_page2 is not None:
+                        waris_exists = True
+                        waris_offset = waris_offset_page2
+                        waris_page = page_2
+
+                # Extract all fields from bounding boxes with section-specific offsets
+                all_fields = {}
+                pasangan_fields = {}
+                waris_fields = {}
+
+                for field_name, box in working_fields.items():
+                    # Skip header fields (not actual data)
+                    if field_name.endswith('_header'):
+                        continue
+
+                    # Skip waris fields if waris section doesn't exist
+                    if field_name.startswith('waris_') and not waris_exists:
+                        continue
+
+                    # Determine section-specific offset and page to extract from
+                    if field_name.startswith('waris_'):
+                        offset = waris_offset if waris_offset is not None else 0
+                        extract_page = waris_page
+                    elif field_name.startswith('pasangan_'):
+                        offset = pasangan_offset
+                        extract_page = page
+                    elif field_name.startswith('anak_'):
+                        offset = anak_offset
+                        extract_page = page
+                    else:
+                        # Main applicant section (MAKLUMAT PEMOHON)
+                        offset = pemohon_offset
+                        extract_page = page
+
+                    # Determine field-specific tolerance (jantina needs tighter tolerance)
+                    tolerance = 3 if field_name == 'jantina' else 5
+
+                    # Extract with section offset and field-specific tolerance
+                    text = self.extract_text_from_box(extract_page, box, y_offset=offset, tolerance=tolerance)
+
+                    # Group fields by prefix
+                    if field_name.startswith('pasangan_'):
+                        clean_name = field_name.replace('pasangan_', '')
+                        pasangan_fields[clean_name] = text
+                    elif field_name.startswith('waris_'):
+                        clean_name = field_name.replace('waris_', '')
+                        waris_fields[clean_name] = text
+                    else:
+                        all_fields[field_name] = text
+
+                # Extract MAKLUMAT ANAK table (always on page 1)
+                children = self.extract_anak_table(page)
+
+                # Structure the data
+                structured_data = self.structure_data(all_fields, pasangan_fields, waris_fields, children)
+
+                # Add metadata about v2 format detection
+                structured_data['document_info']['v2_format_detected'] = has_v2_border
+
+                return structured_data
+        finally:
+            # Clean up temporary file if created (no-op now)
+            if temp_file:
+                cleanup_temp_file(temp_file)
 
     def clean_age_field(self, age_text: str) -> str:
         """Clean age field by removing text after TAHUN
@@ -677,24 +720,111 @@ class STRExtractor:
 
         return digits_only
 
+    def smart_combine_address(self, alamat_surat: str, poskod: str,
+                             bandar_daerah: str, negeri: str) -> str:
+        """Smart address combination that avoids duplicating information
+
+        Args:
+            alamat_surat: Main address field (may contain complete or partial address)
+            poskod: Postal code
+            bandar_daerah: District/city
+            negeri: State
+
+        Returns:
+            Combined address with no duplication
+        """
+        if not alamat_surat:
+            alamat_surat = ""
+
+        # Normalize for comparison (uppercase, remove extra spaces)
+        alamat_upper = ' '.join(alamat_surat.upper().split())
+
+        # Clean individual components
+        poskod_clean = self.clean_postal_code(poskod) if poskod else ""
+        bandar_clean = self.clean_remove_numbers(bandar_daerah) if bandar_daerah else ""
+        negeri_clean = self.clean_remove_section_labels(negeri) if negeri else ""
+
+        # Components to potentially add
+        parts_to_add = []
+
+        # Check if postal code is already in alamat_surat
+        if poskod_clean and poskod_clean not in alamat_upper:
+            parts_to_add.append(poskod_clean)
+
+        # Check if district is already in alamat_surat
+        # Handle partial matches (e.g., "KUALA LUMPUR" in "W.P. KUALA LUMPUR")
+        if bandar_clean:
+            bandar_normalized = ' '.join(bandar_clean.upper().split())
+            # Check if district name (or significant part) is in address
+            if bandar_normalized not in alamat_upper:
+                # Also check if key words from district are present
+                bandar_words = set(bandar_normalized.split())
+                alamat_words = set(alamat_upper.split())
+                # If less than half the words are present, add the district
+                if len(bandar_words & alamat_words) < len(bandar_words) * 0.5:
+                    parts_to_add.append(bandar_clean)
+
+        # Check if state is already in alamat_surat
+        # Handle variations like "W.P." vs "WILAYAH PERSEKUTUAN"
+        if negeri_clean:
+            negeri_normalized = ' '.join(negeri_clean.upper().split())
+
+            # State abbreviations mapping
+            state_variations = {
+                'W.P.': ['WILAYAH PERSEKUTUAN', 'WP', 'W.P.', 'W.P'],
+                'WILAYAH PERSEKUTUAN': ['W.P.', 'WP', 'WILAYAH PERSEKUTUAN'],
+                'KUALA LUMPUR': ['KL', 'K.L.', 'KUALA LUMPUR'],
+                'SELANGOR': ['SELANGOR', 'SEL'],
+                'PULAU PINANG': ['PULAU PINANG', 'PENANG', 'P.PINANG'],
+                'JOHOR': ['JOHOR', 'JHR'],
+                'MELAKA': ['MELAKA', 'MALACCA', 'MLK'],
+            }
+
+            # Check if any variation of the state is already present
+            state_found = False
+            for state_key, variations in state_variations.items():
+                if any(keyword in negeri_normalized for keyword in [state_key]):
+                    # Check if any variation is in alamat_surat
+                    if any(var in alamat_upper for var in variations):
+                        state_found = True
+                        break
+
+            # If state not found in any form, check direct match
+            if not state_found and negeri_normalized not in alamat_upper:
+                # Also check word overlap
+                negeri_words = set(negeri_normalized.split())
+                alamat_words = set(alamat_upper.split())
+                if len(negeri_words & alamat_words) < len(negeri_words) * 0.5:
+                    parts_to_add.append(negeri_clean)
+
+        # Combine: start with alamat_surat, then add missing parts
+        result_parts = [alamat_surat] if alamat_surat else []
+        result_parts.extend(parts_to_add)
+
+        # Join with comma and clean up
+        combined = ', '.join(part for part in result_parts if part)
+
+        # Final cleanup: remove section labels
+        combined = self.clean_remove_section_labels(combined)
+
+        # Clean up multiple consecutive commas and extra spaces
+        combined = re.sub(r',\s*,+', ',', combined)
+        combined = re.sub(r'\s+', ' ', combined).strip()
+        combined = combined.strip(',').strip()
+
+        return combined
+
     def structure_data(self, pemohon_fields: Dict[str, str], pasangan_fields: Dict[str, str],
                       waris_fields: Dict[str, str], children: List[Dict[str, str]]) -> Dict[str, Any]:
         """Structure the extracted data into logical groups"""
 
-        # Construct complete address
-        address_parts = []
-        if pemohon_fields.get('alamat_surat'):
-            address_parts.append(pemohon_fields['alamat_surat'])
-        if pemohon_fields.get('poskod'):
-            address_parts.append(pemohon_fields['poskod'])
-        if pemohon_fields.get('bandar_daerah'):
-            address_parts.append(pemohon_fields['bandar_daerah'])
-        if pemohon_fields.get('negeri'):
-            address_parts.append(pemohon_fields['negeri'])
-
-        full_address = ', '.join(address_parts)
-        # Clean "Pemohon" from the combined address
-        full_address = self.clean_remove_section_labels(full_address)
+        # Smart address combination - avoids duplication
+        full_address = self.smart_combine_address(
+            alamat_surat=pemohon_fields.get('alamat_surat', ''),
+            poskod=pemohon_fields.get('poskod', ''),
+            bandar_daerah=pemohon_fields.get('bandar_daerah', ''),
+            negeri=pemohon_fields.get('negeri', '')
+        )
 
         structured = {
             'document_info': {
@@ -811,12 +941,41 @@ class STRExtractor:
 
         return '\n'.join(lines)
 
+    def format_minimal_details_column(self, data: Dict[str, Any]) -> str:
+        """Format only the first 13 numbered items for Minimal Detail column"""
+        lines = []
+
+        # Get data sections
+        pemohon = data.get('pemohon', {})
+        pasangan = data.get('pasangan', {})
+        waris = data.get('waris', {})
+
+        # Only the numbered minimal fields (1-13)
+        lines.append(f"(1) NAME :- {pemohon.get('nama', '')}")
+        lines.append(f"(2) IC :- {pemohon.get('no_mykad', '')}")
+        lines.append(f"(3) PH1 :- {pemohon.get('telefon_bimbit', '')}")
+        lines.append(f"(4) PH2 :- {pemohon.get('telefon_rumah', '')}")
+        lines.append(f"(5) ADDRESS :- {pemohon.get('alamat', '')}")
+        lines.append(f"(6) SPOUSE IC :- {pasangan.get('no_mykad', '')}")
+        lines.append(f"(7) SPOUSE NAME :- {pasangan.get('nama', '')}")
+        lines.append(f"(8) SPOUSE PH :- {pasangan.get('telefon', '')}")
+        lines.append(f"(9) RELATION :- {waris.get('hubungan', '')}")
+        lines.append(f"(10) REL-IC :- {waris.get('no_pengenalan', '')}")
+        lines.append(f"(11) REL-NAME :- {waris.get('nama', '')}")
+        lines.append(f"(12) REL-PH1 :- {waris.get('telefon', '')}")
+        lines.append(f"(13) EMAIL :- {pemohon.get('email', '')}")
+
+        return '\n'.join(lines)
+
     def to_excel_row(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Convert structured data to flat row for Excel"""
         row_data = {}
 
         # Add Card Number as empty column (will be positioned after pemohon_no_mykad)
         row_data['Card Number'] = ''
+
+        # Add Minimal Detail column with only top 13 items
+        row_data['Minimal Detail'] = self.format_minimal_details_column(data)
 
         # Add Details column with formatted multiline text
         row_data['Details'] = self.format_details_column(data)

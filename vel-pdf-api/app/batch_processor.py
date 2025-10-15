@@ -98,16 +98,18 @@ class BatchProcessor:
             other_cols = [col for col in all_columns if col not in first_cols]
             ordered_columns = first_cols + other_cols
         else:
-            # For everything mode: pemohon_no_mykad, Card Number, Details, then other data columns, then document columns, then source_file
+            # For everything mode: pemohon_no_mykad, Card Number, Minimal Detail, Details, then other data columns, then document columns, then source_file
             document_cols = [col for col in all_columns if col.startswith('document_')]
             source_file_col = ['source_file'] if 'source_file' in all_columns else []
 
-            # Ensure pemohon_no_mykad, Card Number, and Details are first
+            # Ensure pemohon_no_mykad, Card Number, Minimal Detail, and Details are first
             first_cols = []
             if 'pemohon_no_mykad' in all_columns:
                 first_cols.append('pemohon_no_mykad')
             if 'Card Number' in all_columns:
                 first_cols.append('Card Number')
+            if 'Minimal Detail' in all_columns:
+                first_cols.append('Minimal Detail')
             if 'Details' in all_columns:
                 first_cols.append('Details')
 
@@ -117,7 +119,7 @@ class BatchProcessor:
                         and col != 'source_file'
                         and col not in first_cols]
 
-            # Reorder: pemohon_no_mykad + Card Number + Details + other data columns + document columns + source_file
+            # Reorder: pemohon_no_mykad + Card Number + Minimal Detail + Details + other data columns + document columns + source_file
             ordered_columns = first_cols + data_cols + document_cols + source_file_col
 
         df = df[ordered_columns]
