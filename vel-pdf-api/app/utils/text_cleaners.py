@@ -40,6 +40,7 @@ def remove_section_labels(text: str) -> str:
         return ""
 
     # Remove section labels (case-insensitive)
+    # for label in ['Pemohon', 'Pasangan', 'Waris', 'Anak', 'Maklumat']:
     for label in ['Pemohon', 'Pasangan', 'Waris', 'Anak']:
         text = re.sub(rf'\s*{label}.*$', '', text, flags=re.IGNORECASE)
 

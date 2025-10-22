@@ -47,21 +47,22 @@ class STRExtractor:
         self.fields = template['fields']
         self.pdf_dimensions = template.get('pdf_dimensions', {})
 
-    def detect_section_offset(self, page, header_field_name, page_count=1):
+    def detect_section_offset(self, page, header_field_name, page_count=1, template_box=None):
         """Detect Y-offset for a section by finding its header position
 
         Args:
             page: pdfplumber page object
             header_field_name: name of the header field (e.g., 'maklumat_waris_header')
             page_count: total number of pages in PDF (default: 1)
+            template_box: Optional box dict to use instead of self.fields (for V2-adjusted coordinates)
 
         Returns:
             Y-offset in pixels (positive = shifted down, negative = shifted up), or None if header not found
         """
-        if header_field_name not in self.fields:
-            return 0
-
-        template_box = self.fields[header_field_name]
+        if template_box is None:
+            if header_field_name not in self.fields:
+                return 0
+            template_box = self.fields[header_field_name]
         template_y = template_box['y']
         template_x = template_box['x']
         template_w = template_box['width']
@@ -348,31 +349,38 @@ class STRExtractor:
 
         return working_fields
 
-    def _calculate_section_offsets(self, pdf, page, has_v2_border: bool) -> Tuple[Dict[str, int], Any, bool]:
+    def _calculate_section_offsets(self, pdf, page, has_v2_border: bool, working_fields: Dict) -> Tuple[Dict[str, int], Any, bool]:
         """Calculate section offsets and determine waris page
+
+        Args:
+            pdf: PDF object
+            page: First page object
+            has_v2_border: Whether PDF has V2 border
+            working_fields: V2-adjusted field coordinates (if applicable)
 
         Returns:
             Tuple of (offsets_dict, waris_page, waris_exists)
         """
         page_count = len(pdf.pages)
 
-        # For v2 format, skip auto-offset detection (use fixed offset already applied)
-        # Exception: WARIS needs dynamic offset due to variable ANAK section length
-        # For v1 format, use auto-offset detection
+        # For v2 format, use V2-adjusted coordinates for offset detection
+        # For v1 format, use original template coordinates
         if has_v2_border:
-            # For waris in v2: detected offset includes v2 border shift, so subtract it
-            # to avoid double-counting (detected offset - v2_offset = additional offset for variable ANAK content)
-            waris_detected_offset = self.detect_section_offset(page, 'maklumat_waris_header', page_count)
+            # Pass V2-adjusted boxes to detect_section_offset for correct coordinate system
+            pasangan_box = working_fields.get('maklumat_pasangan_header')
+            waris_box = working_fields.get('maklumat_waris_header')
 
-            # Only apply adjustment if header was actually found (distinguish None from 0)
-            if waris_detected_offset is not None:
-                waris_adjusted_offset = waris_detected_offset - int(V2_OFFSET_Y)
-            else:
-                waris_adjusted_offset = None  # Header not found on page 1
+            # Detect offsets using V2-adjusted template coordinates
+            pasangan_detected_offset = self.detect_section_offset(page, 'maklumat_pasangan_header', page_count, template_box=pasangan_box)
+            waris_detected_offset = self.detect_section_offset(page, 'maklumat_waris_header', page_count, template_box=waris_box)
+
+            # Use detected offsets directly (no adjustment needed - already in same coordinate system)
+            pasangan_adjusted_offset = pasangan_detected_offset if pasangan_detected_offset is not None else 0
+            waris_adjusted_offset = waris_detected_offset
 
             offsets = {
                 'pemohon': 0,
-                'pasangan': 0,
+                'pasangan': pasangan_adjusted_offset,
                 'anak': 0,
                 'waris': waris_adjusted_offset
             }
@@ -392,14 +400,12 @@ class STRExtractor:
         # If waris not found on page 1 and there's a page 2, check page 2
         if not waris_exists and page_count > 1:
             page_2 = pdf.pages[1]
-            waris_offset_page2 = self.detect_section_offset(page_2, 'maklumat_waris_header', page_count)
+            # For V2 format, use V2-adjusted box; for V1, use default
+            waris_box_page2 = waris_box if has_v2_border else None
+            waris_offset_page2 = self.detect_section_offset(page_2, 'maklumat_waris_header', page_count, template_box=waris_box_page2)
             if waris_offset_page2 is not None:
                 waris_exists = True
-                # Apply v2 adjustment (same logic as page 1 WARIS)
-                if has_v2_border:
-                    offsets['waris'] = waris_offset_page2 - int(V2_OFFSET_Y)
-                else:
-                    offsets['waris'] = waris_offset_page2
+                offsets['waris'] = waris_offset_page2
                 waris_page = page_2
 
         return offsets, waris_page, waris_exists
@@ -478,8 +484,8 @@ class STRExtractor:
                 # STAGE 1: Load appropriate template based on status_perkahwinan
                 working_fields = self._load_template_by_status(page, working_fields, has_v2_border)
 
-                # STAGE 2: Calculate section offsets
-                offsets, waris_page, waris_exists = self._calculate_section_offsets(pdf, page, has_v2_border)
+                # STAGE 2: Calculate section offsets (pass V2-adjusted working_fields)
+                offsets, waris_page, waris_exists = self._calculate_section_offsets(pdf, page, has_v2_border, working_fields)
 
                 # STAGE 3: Extract all fields
                 all_fields, pasangan_fields, waris_fields = self._extract_all_fields(
@@ -600,7 +606,7 @@ class STRExtractor:
                 }
             },
             'pasangan': {
-                'nama': pasangan_fields.get('nama', ''),
+                'nama': remove_section_labels(pasangan_fields.get('nama', '')),
                 'no_mykad': pasangan_fields.get('no_mykad', ''),
                 'telefon': extract_numbers_only(pasangan_fields.get('no_telefon', '')),
                 'jantina': clean_jantina_field(pasangan_fields.get('jantina', '')),
